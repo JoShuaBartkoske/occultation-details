@@ -151,6 +151,10 @@ activemq-data/
 .env
 .envrc
 .venv
+
+# Google service account credentials — never commit these
+*.json
+service_account*.json
 env/
 venv/
 ENV/
