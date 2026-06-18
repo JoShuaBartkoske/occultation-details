@@ -263,10 +263,10 @@ def query_starhorse(source_id: str) -> Optional[object]:
     print(f"[VizieR] Querying StarHorse (I/354) for source_id = {source_id}")
 
     v = Vizier(columns=["*"], row_limit=5)
-    # I/354 table is "I/354/starhorse" — filter on GaiaEDR3 source_id column
+    # I/354 table is "I/354/starhorse" — filter on Source column
     try:
-        result = v.query_constraints(catalog="I/354/starhorse",
-                                     GaiaEDR3=source_id)
+        result = v.query_constraints(catalog="I/354/starhorse2021",
+                                     Source=source_id)
         if result and len(result) > 0 and len(result[0]) > 0:
             return result[0][0]
     except Exception as e:
