@@ -66,6 +66,7 @@ TAB_STELLAR   = "Stellar Observed Parameters"
 TAB_STARHORSE = "StarHorse Parameters"
 TAB_GSP       = "GSP Parameters"
 TAB_ASTEROID  = "Asteroid Parameters"
+TAB_DETECTIONS = "Occultation Detections"
 
 # Row 1 is the header; data starts at row 2
 HEADER_ROW = 1
@@ -452,6 +453,134 @@ def write_asteroid_to_sheets(spreadsheet: gspread.Spreadsheet, d: dict) -> None:
     print(f"[SHEETS] Asteroid Parameters → row {row_num}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Batch runner — reads Occultation Detections and processes every row
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _already_populated(ws: gspread.Worksheet, id_col: int, id_value: str) -> bool:
+    """
+    Return True if the row for id_value already has data beyond the ID column
+    (i.e., at least one non-empty cell in columns B onward on that row).
+    """
+    col_values = ws.col_values(id_col)
+    id_value_str = str(id_value).strip()
+    for i, cell in enumerate(col_values):
+        if str(cell).strip() == id_value_str:
+            row_num = i + 1
+            # Fetch the full row to check for existing data
+            row_data = ws.row_values(row_num)
+            # Check whether anything beyond column A is filled
+            return any(str(v).strip() for v in row_data[1:])
+    return False  # not present at all → not populated
+
+
+def run_batch(
+    spreadsheet: gspread.Spreadsheet,
+    dry_run: bool = False,
+    force: bool = False,
+    star_only: bool = False,
+    asteroid_only: bool = False,
+) -> None:
+    """
+    Read every row from the Occultation Detections tab (columns A and B),
+    then for each unique star and asteroid:
+      - query the relevant data sources
+      - write results into the matching tabs
+      - skip entries that already have data unless --force is passed
+
+    Args:
+        spreadsheet:   open gspread Spreadsheet object
+        dry_run:       print what would be written without touching Sheets
+        force:         overwrite rows that already have data
+        star_only:     only process stars, skip asteroids
+        asteroid_only: only process asteroids, skip stars
+    """
+    ws_det = spreadsheet.worksheet(TAB_DETECTIONS)
+    all_rows = ws_det.get_all_values()
+
+    if len(all_rows) < 2:
+        print("[BATCH] Occultation Detections tab is empty — nothing to do.")
+        return
+
+    # Skip header row; columns are 0-indexed here
+    data_rows = all_rows[1:]
+
+    # Collect unique star IDs and asteroid names, preserving encounter order
+    seen_stars     = {}   # star_id  → first row number (1-based, for reporting)
+    seen_asteroids = {}   # asteroid_id → first row number
+
+    for idx, row in enumerate(data_rows, start=2):  # row 2 = first data row
+        star_id     = row[0].strip() if len(row) > 0 else ""
+        asteroid_num = row[1].strip() if len(row) > 1 else ""
+        if star_id and star_id not in seen_stars:
+            seen_stars[star_id] = idx
+        if asteroid_num and asteroid_num not in seen_asteroids:
+            seen_asteroids[asteroid_num] = idx
+
+    print(f"\n[BATCH] Found {len(seen_stars)} unique star(s) and "
+          f"{len(seen_asteroids)} unique asteroid(s) in Occultation Detections.")
+
+    # ── Process stars ─────────────────────────────────────────────────────────
+    if not asteroid_only:
+        ws_stellar = spreadsheet.worksheet(TAB_STELLAR)
+        star_ok = star_skip = star_fail = 0
+
+        for star_id in seen_stars:
+            # Check for existing data unless force mode
+            if not force and _already_populated(ws_stellar, id_col=1, id_value=star_id):
+                print(f"[BATCH] SKIP star {star_id!r} — already in Stellar Observed Parameters "
+                      f"(use --force to overwrite)")
+                star_skip += 1
+                continue
+
+            try:
+                data = extract_star_data(star_id)
+                if dry_run:
+                    print(f"[DRY-RUN] Would write star {star_id!r}: "
+                          f"Gaia={data['gaia_id'] or 'not found'}, "
+                          f"Teff={data['teff'] or '—'}, "
+                          f"G={data['g_mag'] or '—'}")
+                else:
+                    write_star_to_sheets(spreadsheet, data)
+                    print(f"[BATCH] ✓ Star {star_id!r} written.")
+                star_ok += 1
+            except Exception as e:
+                print(f"[BATCH] ✗ Star {star_id!r} failed: {e}")
+                star_fail += 1
+
+        print(f"\n[BATCH] Stars: {star_ok} written, {star_skip} skipped, {star_fail} failed.")
+
+    # ── Process asteroids ─────────────────────────────────────────────────────
+    if not star_only:
+        ws_asteroid = spreadsheet.worksheet(TAB_ASTEROID)
+        ast_ok = ast_skip = ast_fail = 0
+
+        for asteroid_num in seen_asteroids:
+            # Skip check: column 1 (Asteroid Number) in Asteroid Parameters tab
+            if not force and _already_populated(ws_asteroid, id_col=1, id_value=asteroid_num):
+                print(f"[BATCH] SKIP asteroid {asteroid_num!r} — already in Asteroid Parameters "
+                      f"(use --force to overwrite)")
+                ast_skip += 1
+                continue
+
+            try:
+                data = extract_asteroid_data(asteroid_num)
+                if dry_run:
+                    print(f"[DRY-RUN] Would write asteroid {asteroid_num!r}: "
+                          f"name={data['name']}, "
+                          f"diam={data['diameter'] or '—'} km")
+                else:
+                    write_asteroid_to_sheets(spreadsheet, data)
+                    print(f"[BATCH] ✓ Asteroid {asteroid_num!r} written.")
+                ast_ok += 1
+            except Exception as e:
+                print(f"[BATCH] ✗ Asteroid {asteroid_num!r} failed: {e}")
+                ast_fail += 1
+
+        print(f"[BATCH] Asteroids: {ast_ok} written, {ast_skip} skipped, {ast_fail} failed.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -477,6 +606,26 @@ def main():
 
     p_ast = sub.add_parser("asteroid", help="Look up an asteroid by number, name, or designation.")
     p_ast.add_argument("asteroid_id", nargs="+", help="Asteroid identifier, e.g. 433 or Eros")
+
+    p_batch = sub.add_parser(
+        "batch",
+        help="Read all star/asteroid IDs from 'Occultation Detections' and populate all tabs.",
+    )
+    p_batch.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite rows that already have data (default: skip populated rows).",
+    )
+    p_batch.add_argument(
+        "--stars-only",
+        action="store_true",
+        help="Only process stars; skip asteroids.",
+    )
+    p_batch.add_argument(
+        "--asteroids-only",
+        action="store_true",
+        help="Only process asteroids; skip stars.",
+    )
 
     args = parser.parse_args()
 
@@ -519,6 +668,40 @@ def main():
         ss = open_sheet(client)
         write_asteroid_to_sheets(ss, data)
         print(f"\n✓ Asteroid {asteroid_id!r} written to Google Sheets.")
+
+    elif args.command == "batch":
+        if args.dry_run:
+            print("[BATCH] Dry-run mode — no data will be written to Sheets.\n")
+            # In dry-run we still need the spreadsheet to read the detections tab
+            if not os.path.isfile(args.key):
+                print(f"Error: service account key not found at {args.key!r}")
+                sys.exit(1)
+            client = get_client(args.key)
+            ss = open_sheet(client)
+            run_batch(
+                ss,
+                dry_run=True,
+                force=args.force,
+                star_only=args.stars_only,
+                asteroid_only=args.asteroids_only,
+            )
+            return
+
+        if not os.path.isfile(args.key):
+            print(f"Error: service account key not found at {args.key!r}")
+            print("Set $GOOGLE_SERVICE_ACCOUNT_KEY or use --key /path/to/key.json")
+            sys.exit(1)
+
+        client = get_client(args.key)
+        ss = open_sheet(client)
+        run_batch(
+            ss,
+            dry_run=False,
+            force=args.force,
+            star_only=args.stars_only,
+            asteroid_only=args.asteroids_only,
+        )
+        print("\n[BATCH] Complete.")
 
 
 if __name__ == "__main__":
